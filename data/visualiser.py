@@ -25,7 +25,7 @@ class DataVisualizer:
 				Returns:
 					pandas.io.formats.style.Styler: Styled statistics table.
 				"""
-				df = self.train if data == "test" else self.train
+				df = self.test if data == "test" else self.train
 				return (
 						df.describe()
 						.T.style.bar(subset=["mean"], color=px.colors.qualitative.G10[2])
@@ -308,3 +308,50 @@ class DataVisualizer:
 				# fig.suptitle(plotname, fontsize=25, fontweight='bold')
 				plt.tight_layout()
 				plt.show()
+
+		def plot_missing_by_target(self, conts, target):
+					"""
+					Plot the proportion of missing values for continuous columns across target classes.
+	
+					Args:
+						conts (list): Continuous column names to evaluate.
+						target (str): Target column name.
+	
+					Returns:
+						None
+					"""
+					missing_cols = [col for col in conts if self.train[col].isna().sum() > 0]
+					if not missing_cols:
+						print("No continuous columns with missing values found.")
+						return
+	
+					missing_counts = (
+						self.train[missing_cols + [target]]
+						.isna()
+						.groupby(self.train[target])
+						.sum()
+						.T
+					)
+	
+					prop_df = missing_counts.div(missing_counts.sum(axis=1), axis=0)
+					prop_df.index.name = "Column"
+					prop_df.columns.name = target
+	
+					fig, ax = plt.subplots(figsize=(max(10, len(missing_cols) * 1.4), 4.8))
+					prop_df.plot(
+						kind='bar',
+						stacked=True,
+						ax=ax,
+						colormap='Set2',
+						edgecolor='white',
+						linewidth=1.2,
+					)
+	
+					ax.set_title(f"Proportion of missing values by {target}", fontsize=11, fontweight='bold')
+					ax.set_ylabel('Proportion (1.0 = 100%)')
+					ax.set_xlabel('Column')
+					ax.tick_params(axis='x', rotation=45)
+					ax.legend(title=target, bbox_to_anchor=(1.02, 1), loc='upper left')
+	
+					plt.tight_layout()
+					plt.show()

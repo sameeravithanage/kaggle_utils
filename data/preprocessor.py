@@ -49,7 +49,7 @@ class PreprocessorFactory:
         
         # Set default imputers if none are passed
         if cont_imputer is None:
-            cont_imputer = SimpleImputer(strategy='median')
+            cont_imputer = 'passthrough'  # No imputation for continuous features by default
         if cat_imputer is None:
             cat_imputer = SimpleImputer(strategy='constant', fill_value='Missing')
         
@@ -66,8 +66,11 @@ class PreprocessorFactory:
 
         # Only add the continuous pipeline if we actually selected continuous features
         if active_conts:
-            num_pipe = Pipeline([('imputer', cont_imputer)])
-            transformers.append(('continuous', num_pipe, active_conts))
+            if cont_imputer == 'passthrough':
+                transformers.append(('continuous', 'passthrough', active_conts))
+            else:
+                num_pipe = Pipeline([('imputer', cont_imputer)])
+                transformers.append(('continuous', num_pipe, active_conts))
 
         # Only add the nominal pipeline if we selected nominal features
         if active_nominal:

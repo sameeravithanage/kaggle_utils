@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 class TreeModelDiagnostics:
-    def __init__(self, metric, preprocessor=None, feature_names=None):
+    def __init__(self, metric, preprocessor=None, feature_names=None, needs_proba=False, target_class_idx=1):
         """
         Initializes the diagnostics engine.
         :param metric: The scoring metric function (e.g., balanced_accuracy_score)
@@ -14,6 +14,8 @@ class TreeModelDiagnostics:
         self.metric = metric
         self.preprocessor = preprocessor
         self.feature_names = feature_names
+        self.needs_proba = needs_proba
+        self.proba_class_idx = target_class_idx
 
     def log_oob_score(self, estimator, fold_idx=1):
         """Safely logs OOB score if the model supports it."""
@@ -59,17 +61,28 @@ class TreeModelDiagnostics:
                 x_valid_transformed = self.preprocessor.transform(x_valid)
             else:
                 x_valid_transformed = x_valid
-
-            # Get predictions from every single tree
-            tree_preds = [tree.predict(x_valid_transformed) for tree in estimator.estimators_]
-            tree_preds = np.array(tree_preds)
             
             # Calculate cumulative mean prediction and score it
             scores = []
-            for i in range(1, len(tree_preds) + 1):
-                cumulative_pred = np.round(tree_preds[:i].mean(axis=0)) # Majority vote
-                score = self.metric(y_valid, cumulative_pred)
-                scores.append(score)
+            
+            if self.needs_proba:
+                tree_preds = np.array([tree.predict_proba(x_valid_transformed) for tree in estimator.estimators_])
+                
+                for i in range(1, len(tree_preds) + 1):
+                    cumulative_prob = tree_preds[:i].mean(axis=0) 
+                    
+                    if self.proba_class_idx is not None:
+                        cumulative_prob = cumulative_prob[:, self.proba_class_idx]
+                        
+                    score = self.metric(y_valid, cumulative_prob)
+                    scores.append(score)
+            else:
+                tree_preds = np.array([tree.predict(x_valid_transformed) for tree in estimator.estimators_])
+                
+                for i in range(1, len(tree_preds) + 1):
+                    cumulative_pred = np.round(tree_preds[:i].mean(axis=0)) 
+                    score = self.metric(y_valid, cumulative_pred)
+                    scores.append(score)
 
             plt.figure(figsize=(8, 4))
             plt.plot(range(1, len(scores) + 1), scores, color='blue')
