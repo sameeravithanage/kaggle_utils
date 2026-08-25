@@ -2,7 +2,9 @@ from sklearn.model_selection import StratifiedKFold
 from imblearn.pipeline import Pipeline as ImbPipeline
 import mlflow
 import numpy as np
+import pandas as pd
 from .tree_model_diagnostics import TreeModelDiagnostics
+
 
 class Learner:
     
@@ -45,16 +47,68 @@ class Learner:
             
         return pipeline.predict(data)
 
-    def fit(self, params=None, plotting={"fi":False, "score_vs_trees":False, "tree_depth":False}):
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.random_state)
+    def _get_estimator(self, pipeline):
+        return (
+            pipeline.named_steps["pred_model"]
+            if hasattr(pipeline, "named_steps")
+            else pipeline
+        )
+
+
+    def _prepare_fold_data(self, pipeline, x_train, y_train, x_valid):
+        x_train_processed = x_train
+        x_valid_processed = x_valid
+    
+        if self.preprocessor:
+            preprocessor = pipeline.named_steps["preprocessor"]
+            x_train_processed = preprocessor.fit_transform(x_train, y_train)
+            x_valid_processed = preprocessor.transform(x_valid)
+    
+        if self.sampler:
+            sampler = pipeline.named_steps["sampler"]
+            x_train_processed, y_train = sampler.fit_resample(
+                x_train_processed,
+                y_train,
+            )
+    
+        return x_train_processed, y_train, x_valid_processed
+
+
+    def _fit_with_early_stopping( self, pipeline, x_train, y_train, x_valid, y_valid,):
+        model = self._get_estimator(pipeline)
+
+        (x_train_processed,y_train_processed,x_valid_processed) = self._prepare_fold_data(pipeline,x_train,y_train,x_valid)
+
+        module_name = model.__class__.__module__
+
+        if module_name.startswith("xgboost."):
+            eval_set = [(x_train_processed, y_train_processed), (x_valid_processed, y_valid)]
+        elif module_name.startswith("catboost."):
+            eval_set = (x_valid_processed, y_valid)
+        else:
+            raise TypeError(
+                            "Early stopping is supported only for XGBoost and CatBoost."
+                        )
+
+        if eval_set is not None:
+            model.fit(
+                x_train_processed,
+                y_train_processed,
+                eval_set=eval_set,
+                verbose=False,
+            )
+
+        return pipeline
+
+    def fit(self, n_folds=5, early_stopping_enabled=False, save_folds_results=False,fold_path=".",params=None, plotting={"fi":False, "score_vs_trees":False, "tree_depth":False}):
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=self.random_state)
         self.fold_accuracy = []
         self.train_accuracy = []
         self.test_preds_list = []
         
-        run_name = f"{self.note}"
-        with mlflow.start_run(run_name=run_name):
-            
-            mlflow.log_param("model", self.model.__name__)
+        with mlflow.start_run(run_name=self.note):
+            model_name = self.model.__name__
+            mlflow.log_param("model", model_name)
             if self.preprocessor:
                 mlflow.log_param("preprocessor", self.preprocessor.__class__.__name__)
             if self.sampler:
@@ -67,8 +121,14 @@ class Learner:
                 x_train_fold, x_test_fold = self.X_train.iloc[train_index], self.X_train.iloc[test_index]
                 y_train_fold, y_test_fold = self.Y_train.iloc[train_index], self.Y_train.iloc[test_index]
             
-                model_instance = self.model(**params) if params else self.model(random_state=self.random_state)
+                model_params = dict(params or {})
+                if not params:
+                    model_params['random_state'] = self.random_state
 
+
+                model_instance = self.model(**model_params)
+
+                # Setting up the pipeline with preprocessor and sampler if they exist
                 steps = []
                 if self.preprocessor:
                     steps.append(('preprocessor', self.preprocessor))
@@ -80,7 +140,12 @@ class Learner:
                 else:
                     pipeline = model_instance
                 self.pipeline = pipeline    
-                pipeline.fit(x_train_fold, y_train_fold)
+
+                # Fit the model with or without early stopping
+                if early_stopping_enabled:
+                    self._fit_with_early_stopping(pipeline,x_train_fold,y_train_fold,x_test_fold,y_test_fold)                                        
+                else:
+                    pipeline.fit(x_train_fold, y_train_fold)
                 
                 # Dynamic Evaluation
                 model_oof_preds = self._get_predictions(pipeline, x_test_fold)
@@ -95,11 +160,37 @@ class Learner:
                 mlflow.log_metric(f"train_acc", train_score, step=i+1)
                 print(f"Fold {i+1} ==> OOF score: {OOFaccScore:.5f}")
 
+                if save_folds_results:
+                    fold_results_df = pd.DataFrame({
+                        "original_index": y_test_fold.index,
+                        "true_label": y_test_fold.values,
+                        "prediction": model_oof_preds
+                    })
                 
-                raw_estimator = pipeline.named_steps['pred_model'] if self.preprocessor else pipeline
+                    csv_filename = f"{fold_path}/{self.note}_fold_{i+1}_predictions.csv"
+                    fold_results_df.to_csv(csv_filename, index=False)
+                
+                raw_estimator = self._get_estimator(pipeline)
+                if model_name in ["XGBClassifier", "XGBRegressor"]:
+                    best_iteration = getattr(raw_estimator, "best_iteration", None)
+                elif model_name in ["CatBoostClassifier", "CatBoostRegressor"]:
+                    best_iteration = getattr(raw_estimator, "best_iteration_", None)
+                else:
+                    best_iteration = None
+
+                if early_stopping_enabled:
+                    mlflow.log_metric(
+                        "best_iteration",
+                        best_iteration,
+                        step=i + 1,
+                    )
                 self.diagnostics.log_oob_score(raw_estimator, i+1)
                 self.diagnostics.plot_feature_importances(pipeline, i+1) if plotting.get("fi", False) else None
-                self.diagnostics.plot_score_vs_trees(pipeline, x_test_fold, y_test_fold, i+1) if plotting.get("score_vs_trees", False) else None
+                if plotting.get("score_vs_trees", False):
+                    if model_name in ["XGBClassifier", "XGBRegressor", "CatBoostClassifier", "CatBoostRegressor"]:
+                        self.diagnostics.plot_boosting_learning_curve(pipeline, i+1)
+                    else:
+                        self.diagnostics.plot_score_vs_trees(pipeline, x_test_fold, y_test_fold, i+1)
                 self.diagnostics.plot_tree_depth_distribution(pipeline, i+1) if plotting.get("tree_depth", False) else None
                     
                 # Always capture full probas for the test set to allow flexible final aggregation
